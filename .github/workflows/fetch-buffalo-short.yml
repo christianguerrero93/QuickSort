@@ -1,25 +1,216 @@
 name: Fetch Buffalo Short
+
 on:
   pull_request:
     branches: [master]
+
 permissions:
   contents: read
+
 jobs:
-  inspect:
+  render:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - run: python -m pip install --quiet yt-dlp
-      - name: Inspect challenge construction
+
+      - name: Install media and browser tools
         run: |
-          ROOT="$(python - <<'PY'
-          import pathlib, yt_dlp
-          print(pathlib.Path(yt_dlp.__file__).parent)
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg xvfb
+          python -m pip install --quiet selenium yt-dlp
+
+      - name: Extract, decipher, and download Short
+        env:
+          DISPLAY: ':99'
+        run: |
+          set -euo pipefail
+          Xvfb :99 -screen 0 1280x900x24 >xvfb.log 2>&1 &
+          sleep 2
+          cat > download.py <<'PY'
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import urllib.parse
+          from pathlib import Path
+
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from yt_dlp import YoutubeDL, parse_options
+          from yt_dlp.extractor.youtube import YoutubeIE
+          from yt_dlp.extractor.youtube.jsc.provider import (
+              JsChallengeRequest,
+              JsChallengeType,
+              NChallengeInput,
+          )
+
+          VIDEO_ID = 'IipXNXmLfSs'
+          SHORT_URL = f'https://www.youtube.com/shorts/{VIDEO_ID}'
+
+          options = Options()
+          options.binary_location = '/usr/bin/google-chrome'
+          for arg in [
+              '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
+              '--mute-audio', '--window-size=1280,900', '--lang=en-US',
+              '--disable-blink-features=AutomationControlled',
+              '--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
+              '(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
+          ]:
+              options.add_argument(arg)
+          options.add_experimental_option('excludeSwitches', ['enable-automation'])
+          options.add_experimental_option('useAutomationExtension', False)
+
+          driver = webdriver.Chrome(options=options)
+          driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+              'source': "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+          })
+          try:
+              driver.get(SHORT_URL)
+              deadline = time.time() + 60
+              source = ''
+              while time.time() < deadline:
+                  source = driver.page_source
+                  if 'var ytInitialPlayerResponse = ' in source and '"streamingData"' in source:
+                      break
+                  time.sleep(0.5)
+              Path('shorts-page.html').write_text(source)
+              driver.save_screenshot('browser-state.png')
+              ua = driver.execute_script('return navigator.userAgent')
+              cookies = driver.get_cookies()
+          finally:
+              driver.quit()
+
+          marker = 'var ytInitialPlayerResponse = '
+          if marker not in source:
+              raise RuntimeError('ytInitialPlayerResponse was not found')
+          start = source.index(marker) + len(marker)
+          player_response, _ = json.JSONDecoder().raw_decode(source[start:])
+
+          formats = player_response.get('streamingData', {}).get('formats', [])
+          direct_formats = [f for f in formats if f.get('url')]
+          if not direct_formats:
+              raise RuntimeError('No direct progressive format found')
+          chosen = max(direct_formats, key=lambda f: (f.get('height', 0), f.get('bitrate', 0)))
+          media_url = chosen['url']
+
+          player_patterns = [
+              r'"PLAYER_JS_URL":"([^"]+)"',
+              r'"jsUrl":"([^"]+)"',
+              r'"js":"([^"]*?/s/player/[^"]+?base\\.js)"',
+              r'(/s/player/[^"\\]+?/base\\.js)',
+          ]
+          player_path = None
+          for pattern in player_patterns:
+              match = re.search(pattern, source)
+              if match:
+                  player_path = match.group(1)
+                  break
+          if not player_path:
+              raise RuntimeError('Player JavaScript URL was not found')
+          player_path = html.unescape(player_path).replace('\\/', '/')
+          try:
+              player_path = bytes(player_path, 'utf-8').decode('unicode_escape')
+          except UnicodeDecodeError:
+              pass
+          player_url = urllib.parse.urljoin('https://www.youtube.com', player_path)
+
+          parsed = urllib.parse.urlsplit(media_url)
+          query = urllib.parse.parse_qs(parsed.query)
+          original_n = query.get('n', [None])[0]
+          solved_n = None
+
+          if original_n:
+              parsed_options = parse_options([
+                  '--js-runtimes', 'node',
+                  '--remote-components', 'ejs:github',
+                  '--verbose',
+              ])
+              with YoutubeDL(parsed_options.ydl_opts) as ydl:
+                  ie = YoutubeIE(ydl)
+                  ie.initialize()
+                  request = JsChallengeRequest(
+                      type=JsChallengeType.N,
+                      video_id=VIDEO_ID,
+                      input=NChallengeInput(challenges=[original_n], player_url=player_url),
+                  )
+                  responses = ie._jsc_director.bulk_solve([request])
+                  if not responses:
+                      raise RuntimeError('n challenge solver returned no response')
+                  solved_n = responses[0][1].output.results.get(original_n)
+                  if not solved_n:
+                      raise RuntimeError('n challenge was not solved')
+
+              pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+              pairs = [(k, solved_n if k == 'n' else v) for k, v in pairs]
+              media_url = urllib.parse.urlunsplit((
+                  parsed.scheme, parsed.netloc, parsed.path,
+                  urllib.parse.urlencode(pairs), parsed.fragment,
+              ))
+
+          cookie_header = '; '.join(f"{c['name']}={c.get('value', '')}" for c in cookies)
+          curl_command = [
+              'curl', '-fL', '--retry', '3', '--retry-delay', '1',
+              '--connect-timeout', '20', '--max-time', '180',
+              '-A', ua,
+              '-e', SHORT_URL,
+              '-H', 'Origin: https://www.youtube.com',
+              '-H', 'Accept: */*',
+              '-H', f'Cookie: {cookie_header}',
+              media_url,
+              '-o', 'downloaded.mp4',
+          ]
+          subprocess.run(curl_command, check=True)
+
+          metadata = {
+              'video_id': VIDEO_ID,
+              'title': player_response.get('videoDetails', {}).get('title'),
+              'lengthSeconds': player_response.get('videoDetails', {}).get('lengthSeconds'),
+              'player_url': player_url,
+              'format': {k: chosen.get(k) for k in (
+                  'itag', 'qualityLabel', 'width', 'height', 'fps', 'bitrate',
+                  'mimeType', 'contentLength', 'approxDurationMs')},
+              'n_challenge_present': bool(original_n),
+              'n_challenge_solved': bool(solved_n),
+          }
+          Path('metadata.json').write_text(json.dumps(metadata, indent=2))
           PY
-          )"
-          echo '--- video solver section ---'
-          sed -n '3260,3350p' "$ROOT/extractor/youtube/_video.py"
-          echo '--- provider classes ---'
-          sed -n '1,230p' "$ROOT/extractor/youtube/jsc/provider.py"
-          echo '--- director API ---'
-          sed -n '1,300p' "$ROOT/extractor/youtube/jsc/_director.py"
+          python download.py
+          test -s downloaded.mp4
+          ffmpeg -hide_banner -loglevel warning -y -i downloaded.mp4 -an \
+            -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p \
+            -movflags +faststart source.mp4
+          ffprobe -v error -show_entries format=duration,size -show_entries stream=width,height \
+            -of json source.mp4 > media-info.json
+          rm -f downloaded.mp4
+
+      - name: Build final-section GIF
+        run: |
+          set -euo pipefail
+          DURATION="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 source.mp4)"
+          START="$(python -c "print(max(0, float('$DURATION') - 5.5))")"
+          ffmpeg -hide_banner -loglevel warning -y -ss "$START" -i source.mp4 \
+            -vf "fps=15,scale=480:-1:flags=lanczos,palettegen=stats_mode=diff" palette.png
+          ffmpeg -hide_banner -loglevel warning -y -ss "$START" -i source.mp4 -i palette.png \
+            -lavfi "fps=15,scale=480:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=sierra2_4a" \
+            -loop 0 buffalo-last-portion.gif
+          ffmpeg -hide_banner -loglevel warning -y -ss "$START" -i source.mp4 -t 5.5 \
+            -c:v libx264 -an -movflags +faststart final-preview.mp4
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: buffalo-short-media
+          path: |
+            source.mp4
+            buffalo-last-portion.gif
+            final-preview.mp4
+            metadata.json
+            media-info.json
+            browser-state.png
+            shorts-page.html
+            xvfb.log
+          if-no-files-found: warn
+          retention-days: 1
