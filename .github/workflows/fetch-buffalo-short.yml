@@ -10,7 +10,7 @@ permissions:
 jobs:
   render:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -20,7 +20,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg jq
 
-      - name: Download Short through public frontends
+      - name: Download or capture the final seconds
         run: |
           set -u
           VIDEO_ID='IipXNXmLfSs'
@@ -51,7 +51,7 @@ jobs:
 
           for BASE in "${PIPED_APIS[@]}"; do
             echo "Piped: $BASE" >> attempts.log
-            if curl -A 'Mozilla/5.0' -fsSL --connect-timeout 10 --max-time 45 \
+            if curl -k -A 'Mozilla/5.0' -fsSL --connect-timeout 7 --max-time 20 \
                 "$BASE/streams/$VIDEO_ID" -o candidate.json 2>> attempts.log; then
               if jq -e '.videoStreams | type == "array" and length > 0' candidate.json >/dev/null 2>&1; then
                 cp candidate.json metadata.json
@@ -81,7 +81,7 @@ jobs:
             )
             for BASE in "${INVIDIOUS[@]}"; do
               echo "Invidious: $BASE" >> attempts.log
-              if curl -A 'Mozilla/5.0' -fsSL --connect-timeout 10 --max-time 45 \
+              if curl -k -A 'Mozilla/5.0' -fsSL --connect-timeout 7 --max-time 20 \
                   "$BASE/api/v1/videos/$VIDEO_ID?local=true" -o candidate.json 2>> attempts.log; then
                 if jq -e '((.formatStreams // []) + (.adaptiveFormats // [])) | length > 0' candidate.json >/dev/null 2>&1; then
                   cp candidate.json metadata.json
@@ -104,17 +104,111 @@ jobs:
             done
           fi
 
+          if [ ! -s source.mp4 ]; then
+            echo 'Public APIs unavailable; trying real browser playback capture' >> attempts.log
+            python -m pip install --quiet selenium pillow
+            cat > capture.py <<'PY'
+          import json
+          import math
+          import os
+          import time
+          from pathlib import Path
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.common.by import By
+          from selenium.webdriver.support.ui import WebDriverWait
+
+          VIDEO_ID = 'IipXNXmLfSs'
+          fps = 12
+          seconds = 8
+          frames_dir = Path('frames')
+          frames_dir.mkdir(exist_ok=True)
+
+          options = Options()
+          options.binary_location = '/usr/bin/google-chrome'
+          for arg in [
+              '--headless=new', '--no-sandbox', '--disable-dev-shm-usage',
+              '--disable-gpu', '--mute-audio', '--autoplay-policy=no-user-gesture-required',
+              '--window-size=960,720', '--hide-scrollbars', '--lang=en-US',
+              '--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
+              '(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36'
+          ]:
+              options.add_argument(arg)
+
+          driver = webdriver.Chrome(options=options)
+          try:
+              url = f'https://www.youtube.com/embed/{VIDEO_ID}?autoplay=1&mute=1&controls=0&rel=0&playsinline=1'
+              driver.get(url)
+              wait = WebDriverWait(driver, 45)
+              video = wait.until(lambda d: d.find_element(By.TAG_NAME, 'video'))
+
+              deadline = time.time() + 45
+              duration = 0.0
+              while time.time() < deadline:
+                  duration = driver.execute_script(
+                      'const v=document.querySelector("video"); '
+                      'v.muted=true; v.volume=0; v.play().catch(()=>{}); '
+                      'return Number.isFinite(v.duration) ? v.duration : 0;'
+                  ) or 0.0
+                  if duration > 0:
+                      break
+                  time.sleep(0.5)
+              if duration <= 0:
+                  driver.save_screenshot('browser-error.png')
+                  raise RuntimeError('Video duration never became available')
+
+              start = max(0.0, duration - seconds)
+              driver.execute_script(
+                  'const v=document.querySelector("video"); '
+                  'v.muted=true; v.currentTime=arguments[0]; v.play();', start
+              )
+              deadline = time.time() + 20
+              while time.time() < deadline:
+                  current = driver.execute_script('return document.querySelector("video").currentTime') or 0
+                  ready = driver.execute_script('return document.querySelector("video").readyState') or 0
+                  if current >= max(0, start - 0.5) and ready >= 2:
+                      break
+                  time.sleep(0.1)
+
+              video = driver.find_element(By.TAG_NAME, 'video')
+              capture_start = time.monotonic()
+              total = int(seconds * fps)
+              for i in range(total):
+                  target = capture_start + i / fps
+                  delay = target - time.monotonic()
+                  if delay > 0:
+                      time.sleep(delay)
+                  video.screenshot(str(frames_dir / f'frame_{i:04d}.png'))
+
+              current = driver.execute_script('return document.querySelector("video").currentTime') or 0
+              with open('metadata.json', 'w') as f:
+                  json.dump({
+                      'capture_method': 'headless_chrome_element_screenshots',
+                      'video_id': VIDEO_ID,
+                      'duration': duration,
+                      'capture_start': start,
+                      'capture_end': current,
+                      'fps': fps,
+                      'frames': total,
+                  }, f, indent=2)
+          finally:
+              driver.quit()
+          PY
+            python capture.py >> attempts.log 2>&1
+            ffmpeg -hide_banner -loglevel warning -y -framerate 12 -i frames/frame_%04d.png \
+              -c:v libx264 -pix_fmt yuv420p -crf 18 -movflags +faststart source.mp4 \
+              >> attempts.log 2>&1
+          fi
+
           test -s source.mp4
-          ffprobe -v error -show_entries format=duration,size -of json source.mp4 > media-info.json
+          ffprobe -v error -show_entries format=duration,size,width,height -of json source.mp4 > media-info.json
 
       - name: Make final-section preview GIF
         if: success()
         run: |
           set -euxo pipefail
-          DURATION="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 source.mp4)"
-          START="$(python -c "print(max(0, float('$DURATION') - 7.0))")"
-          ffmpeg -y -ss "$START" -i source.mp4 -vf "fps=12,scale=480:-1:flags=lanczos,palettegen=stats_mode=diff" palette.png
-          ffmpeg -y -ss "$START" -i source.mp4 -i palette.png -lavfi "fps=12,scale=480:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=sierra2_4a" -loop 0 last-seven-seconds.gif
+          ffmpeg -y -i source.mp4 -vf "fps=12,scale=600:-1:flags=lanczos,palettegen=stats_mode=diff" palette.png
+          ffmpeg -y -i source.mp4 -i palette.png -lavfi "fps=12,scale=600:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=sierra2_4a" -loop 0 final-capture.gif
 
       - name: Upload media and diagnostics
         if: always()
@@ -125,8 +219,14 @@ jobs:
             source.mp4
             metadata.json
             media-info.json
-            last-seven-seconds.gif
+            final-capture.gif
             attempts.log
             candidate.json
+            browser-error.png
+            frames/frame_0000.png
+            frames/frame_0024.png
+            frames/frame_0048.png
+            frames/frame_0072.png
+            frames/frame_0095.png
           if-no-files-found: warn
           retention-days: 1
