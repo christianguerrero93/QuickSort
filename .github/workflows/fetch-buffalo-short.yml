@@ -19,16 +19,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg xvfb
-          python -m pip install --quiet selenium
+          python -m pip install --quiet selenium yt-dlp
 
-      - name: Extract and download the Short
+      - name: Establish browser session and download Short
         env:
           DISPLAY: ':99'
         run: |
           set -euxo pipefail
           Xvfb :99 -screen 0 1280x900x24 >xvfb.log 2>&1 &
           sleep 2
-          cat > extract.py <<'PY'
+          cat > session.py <<'PY'
           import json
           import time
           from pathlib import Path
@@ -55,7 +55,7 @@ jobs:
           })
           try:
               driver.get(f'https://www.youtube.com/shorts/{VIDEO_ID}')
-              deadline = time.time() + 60
+              deadline = time.time() + 45
               source = ''
               while time.time() < deadline:
                   source = driver.page_source
@@ -63,38 +63,58 @@ jobs:
                       break
                   time.sleep(0.5)
               Path('shorts-page.html').write_text(source)
+              Path('browser-error.png').write_bytes(driver.get_screenshot_as_png())
+              ua = driver.execute_script('return navigator.userAgent')
+              Path('user-agent.txt').write_text(ua)
+
+              cookies = driver.get_cookies()
+              lines = ['# Netscape HTTP Cookie File']
+              for c in cookies:
+                  domain = c.get('domain') or '.youtube.com'
+                  include_subdomains = 'TRUE' if domain.startswith('.') else 'FALSE'
+                  path = c.get('path') or '/'
+                  secure = 'TRUE' if c.get('secure') else 'FALSE'
+                  expiry = str(int(c.get('expiry', 2147483647)))
+                  lines.append('\t'.join([
+                      domain, include_subdomains, path, secure, expiry,
+                      c['name'], c.get('value', '')
+                  ]))
+              Path('youtube-cookies.txt').write_text('\n'.join(lines) + '\n')
+
               marker = 'var ytInitialPlayerResponse = '
-              if marker not in source:
-                  driver.save_screenshot('browser-error.png')
-                  raise RuntimeError('ytInitialPlayerResponse was not found')
-              start = source.index(marker) + len(marker)
-              response, _ = json.JSONDecoder().raw_decode(source[start:])
-              formats = response.get('streamingData', {}).get('formats', [])
-              direct = [f for f in formats if f.get('url')]
-              if not direct:
-                  driver.save_screenshot('browser-error.png')
-                  raise RuntimeError('No progressive media URL was present')
-              chosen = max(direct, key=lambda f: (f.get('height', 0), f.get('bitrate', 0)))
-              Path('stream-url.txt').write_text(chosen['url'])
-              Path('metadata.json').write_text(json.dumps({
-                  'video_id': VIDEO_ID,
-                  'title': response.get('videoDetails', {}).get('title'),
-                  'lengthSeconds': response.get('videoDetails', {}).get('lengthSeconds'),
-                  'chosen_format': {k: chosen.get(k) for k in [
-                      'itag', 'qualityLabel', 'width', 'height', 'fps', 'bitrate', 'mimeType', 'contentLength'
-                  ]},
-                  'playabilityStatus': response.get('playabilityStatus', {}),
-                  'storyboards': response.get('storyboards', {}),
-              }, indent=2))
+              metadata = {'video_id': VIDEO_ID, 'browser_user_agent': ua, 'cookie_names': [c['name'] for c in cookies]}
+              if marker in source:
+                  start = source.index(marker) + len(marker)
+                  response, _ = json.JSONDecoder().raw_decode(source[start:])
+                  metadata.update({
+                      'title': response.get('videoDetails', {}).get('title'),
+                      'lengthSeconds': response.get('videoDetails', {}).get('lengthSeconds'),
+                      'playabilityStatus': response.get('playabilityStatus', {}),
+                      'storyboards': response.get('storyboards', {}),
+                  })
+              Path('metadata.json').write_text(json.dumps(metadata, indent=2))
           finally:
               driver.quit()
           PY
-          python extract.py
-          STREAM_URL="$(cat stream-url.txt)"
-          ffmpeg -hide_banner -loglevel warning -y \
-            -headers $'Referer: https://www.youtube.com/\r\nUser-Agent: Mozilla/5.0\r\n' \
-            -i "$STREAM_URL" -an -c:v libx264 -preset veryfast -crf 18 \
-            -pix_fmt yuv420p -movflags +faststart source.mp4
+          python session.py
+          UA="$(cat user-agent.txt)"
+          yt-dlp \
+            --cookies youtube-cookies.txt \
+            --user-agent "$UA" \
+            --referer 'https://www.youtube.com/' \
+            --js-runtimes node \
+            --remote-components ejs:github \
+            --no-playlist \
+            -f '18/b[ext=mp4][height<=720]/b[height<=720]/b' \
+            --merge-output-format mp4 \
+            -o 'downloaded.%(ext)s' \
+            'https://www.youtube.com/shorts/IipXNXmLfSs'
+          VIDEO="$(find . -maxdepth 1 -type f \( -name 'downloaded.mp4' -o -name 'downloaded.webm' -o -name 'downloaded.mkv' \) | head -n1)"
+          test -n "$VIDEO"
+          ffmpeg -hide_banner -loglevel warning -y -i "$VIDEO" -an \
+            -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p \
+            -movflags +faststart source.mp4
+          rm -f youtube-cookies.txt user-agent.txt
           ffprobe -v error -show_entries format=duration,size -show_entries stream=width,height \
             -of json source.mp4 > media-info.json
 
@@ -118,7 +138,6 @@ jobs:
             media-info.json
             buffalo-last-portion.gif
             final-preview.mp4
-            shorts-page.html
             browser-error.png
             xvfb.log
           if-no-files-found: warn
