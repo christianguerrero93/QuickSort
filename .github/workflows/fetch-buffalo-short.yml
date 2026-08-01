@@ -8,137 +8,28 @@ permissions:
   contents: read
 
 jobs:
-  render:
+  inspect:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Install capture tools
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet yt-dlp
+      - name: Inspect YoutubeIE helpers
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg xvfb
-          python -m pip install --quiet selenium yt-dlp
-
-      - name: Establish browser session and download Short
-        env:
-          DISPLAY: ':99'
-        run: |
-          set -euxo pipefail
-          Xvfb :99 -screen 0 1280x900x24 >xvfb.log 2>&1 &
-          sleep 2
-          cat > session.py <<'PY'
-          import json
-          import time
-          from pathlib import Path
-          from selenium import webdriver
-          from selenium.webdriver.chrome.options import Options
-
-          VIDEO_ID = 'IipXNXmLfSs'
-          options = Options()
-          options.binary_location = '/usr/bin/google-chrome'
-          for arg in [
-              '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
-              '--mute-audio', '--window-size=1280,900', '--lang=en-US',
-              '--disable-blink-features=AutomationControlled',
-              '--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
-              '(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36'
-          ]:
-              options.add_argument(arg)
-          options.add_experimental_option('excludeSwitches', ['enable-automation'])
-          options.add_experimental_option('useAutomationExtension', False)
-
-          driver = webdriver.Chrome(options=options)
-          driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-              'source': "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-          })
-          try:
-              driver.get(f'https://www.youtube.com/shorts/{VIDEO_ID}')
-              deadline = time.time() + 45
-              source = ''
-              while time.time() < deadline:
-                  source = driver.page_source
-                  if 'var ytInitialPlayerResponse = ' in source and '"streamingData"' in source:
-                      break
-                  time.sleep(0.5)
-              Path('shorts-page.html').write_text(source)
-              Path('browser-error.png').write_bytes(driver.get_screenshot_as_png())
-              ua = driver.execute_script('return navigator.userAgent')
-              Path('user-agent.txt').write_text(ua)
-
-              cookies = driver.get_cookies()
-              lines = ['# Netscape HTTP Cookie File']
-              for c in cookies:
-                  domain = c.get('domain') or '.youtube.com'
-                  include_subdomains = 'TRUE' if domain.startswith('.') else 'FALSE'
-                  path = c.get('path') or '/'
-                  secure = 'TRUE' if c.get('secure') else 'FALSE'
-                  expiry = str(int(c.get('expiry', 2147483647)))
-                  lines.append('\t'.join([
-                      domain, include_subdomains, path, secure, expiry,
-                      c['name'], c.get('value', '')
-                  ]))
-              Path('youtube-cookies.txt').write_text('\n'.join(lines) + '\n')
-
-              marker = 'var ytInitialPlayerResponse = '
-              metadata = {'video_id': VIDEO_ID, 'browser_user_agent': ua, 'cookie_names': [c['name'] for c in cookies]}
-              if marker in source:
-                  start = source.index(marker) + len(marker)
-                  response, _ = json.JSONDecoder().raw_decode(source[start:])
-                  metadata.update({
-                      'title': response.get('videoDetails', {}).get('title'),
-                      'lengthSeconds': response.get('videoDetails', {}).get('lengthSeconds'),
-                      'playabilityStatus': response.get('playabilityStatus', {}),
-                      'storyboards': response.get('storyboards', {}),
-                  })
-              Path('metadata.json').write_text(json.dumps(metadata, indent=2))
-          finally:
-              driver.quit()
+          python - <<'PY'
+          import inspect
+          import yt_dlp
+          from yt_dlp.extractor.youtube import YoutubeIE
+          print('version', yt_dlp.version.__version__)
+          for name in dir(YoutubeIE):
+              if any(x in name.lower() for x in ('nsig','decrypt','player_js','signature')):
+                  obj = getattr(YoutubeIE, name)
+                  try:
+                      print(name, inspect.signature(obj))
+                  except Exception:
+                      print(name, type(obj))
+          for name in ('_decrypt_nsig', '_extract_n_function_name', '_decrypt_signature'):
+              obj = getattr(YoutubeIE, name, None)
+              if obj:
+                  print('\nSOURCE', name)
+                  print(inspect.getsource(obj))
           PY
-          python session.py
-          UA="$(cat user-agent.txt)"
-          yt-dlp \
-            --cookies youtube-cookies.txt \
-            --user-agent "$UA" \
-            --referer 'https://www.youtube.com/' \
-            --js-runtimes node \
-            --remote-components ejs:github \
-            --no-playlist \
-            -f '18/b[ext=mp4][height<=720]/b[height<=720]/b' \
-            --merge-output-format mp4 \
-            -o 'downloaded.%(ext)s' \
-            'https://www.youtube.com/shorts/IipXNXmLfSs'
-          VIDEO="$(find . -maxdepth 1 -type f \( -name 'downloaded.mp4' -o -name 'downloaded.webm' -o -name 'downloaded.mkv' \) | head -n1)"
-          test -n "$VIDEO"
-          ffmpeg -hide_banner -loglevel warning -y -i "$VIDEO" -an \
-            -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p \
-            -movflags +faststart source.mp4
-          rm -f youtube-cookies.txt user-agent.txt
-          ffprobe -v error -show_entries format=duration,size -show_entries stream=width,height \
-            -of json source.mp4 > media-info.json
-
-      - name: Make final-section GIF
-        run: |
-          set -euxo pipefail
-          DURATION="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 source.mp4)"
-          START="$(python -c "print(max(0, float('$DURATION') - 5.5))")"
-          ffmpeg -y -ss "$START" -i source.mp4 -vf "fps=15,scale=480:-1:flags=lanczos,palettegen=stats_mode=diff" palette.png
-          ffmpeg -y -ss "$START" -i source.mp4 -i palette.png -lavfi "fps=15,scale=480:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=sierra2_4a" -loop 0 buffalo-last-portion.gif
-          ffmpeg -y -ss "$START" -i source.mp4 -t 5.5 -c:v libx264 -an -movflags +faststart final-preview.mp4
-
-      - name: Upload capture
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: buffalo-short-media
-          path: |
-            source.mp4
-            metadata.json
-            media-info.json
-            buffalo-last-portion.gif
-            final-preview.mp4
-            browser-error.png
-            xvfb.log
-          if-no-files-found: warn
-          retention-days: 1
