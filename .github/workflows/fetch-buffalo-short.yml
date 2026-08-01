@@ -10,12 +10,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python -m pip install --quiet yt-dlp
-      - name: Locate n-signature implementation
+      - name: Inspect challenge construction
         run: |
           ROOT="$(python - <<'PY'
           import pathlib, yt_dlp
           print(pathlib.Path(yt_dlp.__file__).parent)
           PY
           )"
-          echo "ROOT=$ROOT"
-          grep -RIn --include='*.py' -E 'decrypt_nsig|nsig|n_function|jsc' "$ROOT/extractor/youtube" "$ROOT" | head -300
+          echo '--- video solver section ---'
+          sed -n '3260,3350p' "$ROOT/extractor/youtube/_video.py"
+          echo '--- provider classes ---'
+          sed -n '1,230p' "$ROOT/extractor/youtube/jsc/provider.py"
+          echo '--- director API ---'
+          sed -n '1,300p' "$ROOT/extractor/youtube/jsc/_director.py"
