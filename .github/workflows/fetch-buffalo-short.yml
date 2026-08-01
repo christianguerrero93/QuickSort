@@ -10,7 +10,7 @@ permissions:
 jobs:
   render:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -19,58 +19,28 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg xvfb
-          python -m pip install --quiet selenium pillow
+          python -m pip install --quiet selenium
 
-      - name: Capture final seconds in Chrome
+      - name: Extract and download the Short
         env:
           DISPLAY: ':99'
         run: |
           set -euxo pipefail
           Xvfb :99 -screen 0 1280x900x24 >xvfb.log 2>&1 &
           sleep 2
-          cat > capture.py <<'PY'
-          import http.server
+          cat > extract.py <<'PY'
           import json
-          import math
-          import os
-          import socketserver
-          import threading
           import time
           from pathlib import Path
           from selenium import webdriver
           from selenium.webdriver.chrome.options import Options
-          from selenium.webdriver.common.by import By
 
           VIDEO_ID = 'IipXNXmLfSs'
-          FPS = 12
-          CLIP_SECONDS = 9
-          frames_dir = Path('frames')
-          frames_dir.mkdir(exist_ok=True)
-          diagnostics = []
-
-          web_dir = Path('web')
-          web_dir.mkdir(exist_ok=True)
-          (web_dir / 'index.html').write_text(f'''<!doctype html>
-          <html><body style="margin:0;background:#000;overflow:hidden">
-          <iframe id="yt" width="960" height="540" style="border:0"
-            src="https://www.youtube.com/embed/{VIDEO_ID}?autoplay=1&mute=1&controls=0&rel=0&playsinline=1&enablejsapi=1&origin=http://127.0.0.1:8765"
-            allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe>
-          </body></html>''')
-
-          class QuietHandler(http.server.SimpleHTTPRequestHandler):
-              def log_message(self, *args):
-                  pass
-
-          handler = lambda *args, **kwargs: QuietHandler(*args, directory=str(web_dir), **kwargs)
-          server = socketserver.ThreadingTCPServer(('127.0.0.1', 8765), handler)
-          threading.Thread(target=server.serve_forever, daemon=True).start()
-
           options = Options()
           options.binary_location = '/usr/bin/google-chrome'
           for arg in [
               '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
-              '--mute-audio', '--autoplay-policy=no-user-gesture-required',
-              '--window-size=1280,900', '--hide-scrollbars', '--lang=en-US',
+              '--mute-audio', '--window-size=1280,900', '--lang=en-US',
               '--disable-blink-features=AutomationControlled',
               '--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
               '(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36'
@@ -83,132 +53,59 @@ jobs:
           driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
               'source': "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
           })
-
-          def accept_consent():
-              for selector in [
-                  "button[aria-label='Accept all']",
-                  "button[aria-label='Reject all']",
-                  "button[aria-label*='Accept']",
-              ]:
-                  try:
-                      button = driver.find_element(By.CSS_SELECTOR, selector)
-                      if button.is_displayed():
-                          button.click()
-                          time.sleep(1)
-                  except Exception:
-                      pass
-
-          def locate_video(mode):
-              if mode == 'embed':
-                  driver.get('http://127.0.0.1:8765/index.html')
-                  time.sleep(2)
-                  frame = driver.find_element(By.ID, 'yt')
-                  driver.switch_to.frame(frame)
-              elif mode == 'watch':
-                  driver.get(f'https://www.youtube.com/watch?v={VIDEO_ID}&autoplay=1')
-                  accept_consent()
-              else:
-                  driver.get(f'https://www.youtube.com/shorts/{VIDEO_ID}')
-                  accept_consent()
-
-              deadline = time.time() + 50
-              video = None
-              while time.time() < deadline:
-                  try:
-                      videos = driver.find_elements(By.TAG_NAME, 'video')
-                      if videos:
-                          video = max(videos, key=lambda e: e.size.get('width', 0) * e.size.get('height', 0))
-                          state = driver.execute_script('''
-                            const v=arguments[0];
-                            v.muted=true; v.volume=0; v.play().catch(()=>{});
-                            const p=document.getElementById('movie_player');
-                            return {
-                              duration: Number.isFinite(v.duration) ? v.duration : 0,
-                              ready: v.readyState,
-                              current: v.currentTime || 0,
-                              error: v.error ? v.error.message : null,
-                              videoId: p && p.getVideoData ? p.getVideoData().video_id : null,
-                              title: document.title,
-                              body: document.body ? document.body.innerText.slice(0, 500) : ''
-                            };
-                          ''', video)
-                          if state['duration'] > 0 and state['ready'] >= 2 and (not state['videoId'] or state['videoId'] == VIDEO_ID):
-                              return video, state
-                  except Exception:
-                      pass
-                  time.sleep(0.5)
-              raise RuntimeError('video never became playable')
-
-          success = False
           try:
-              for mode in ['embed', 'watch', 'shorts']:
-                  try:
-                      driver.switch_to.default_content()
-                      video, state = locate_video(mode)
-                      duration = float(state['duration'])
-                      start = max(0.0, duration - CLIP_SECONDS)
-                      driver.execute_script('''
-                        const v=arguments[0];
-                        v.muted=true; v.volume=0; v.currentTime=arguments[1];
-                        v.play().catch(()=>{});
-                      ''', video, start)
-
-                      deadline = time.time() + 20
-                      while time.time() < deadline:
-                          current, ready = driver.execute_script(
-                              'return [arguments[0].currentTime, arguments[0].readyState];', video)
-                          if current >= max(0, start - 0.4) and ready >= 2:
-                              break
-                          time.sleep(0.1)
-
-                      capture_start = time.monotonic()
-                      total = int(CLIP_SECONDS * FPS)
-                      for i in range(total):
-                          target = capture_start + i / FPS
-                          delay = target - time.monotonic()
-                          if delay > 0:
-                              time.sleep(delay)
-                          video.screenshot(str(frames_dir / f'frame_{i:04d}.png'))
-
-                      end_time = driver.execute_script('return arguments[0].currentTime;', video)
-                      metadata = {
-                          'capture_method': f'chrome_{mode}',
-                          'video_id': VIDEO_ID,
-                          'duration': duration,
-                          'capture_start': start,
-                          'capture_end': end_time,
-                          'fps': FPS,
-                          'frames': total,
-                          'element_size': video.size,
-                      }
-                      Path('metadata.json').write_text(json.dumps(metadata, indent=2))
-                      success = True
+              driver.get(f'https://www.youtube.com/shorts/{VIDEO_ID}')
+              deadline = time.time() + 60
+              source = ''
+              while time.time() < deadline:
+                  source = driver.page_source
+                  if 'var ytInitialPlayerResponse = ' in source and '"streamingData"' in source:
                       break
-                  except Exception as exc:
-                      diagnostics.append({'mode': mode, 'error': repr(exc), 'url': driver.current_url})
-                      try:
-                          driver.switch_to.default_content()
-                          driver.save_screenshot(f'browser-{mode}-error.png')
-                          Path(f'browser-{mode}-source.html').write_text(driver.page_source)
-                      except Exception:
-                          pass
-              if not success:
-                  raise RuntimeError(json.dumps(diagnostics))
+                  time.sleep(0.5)
+              Path('shorts-page.html').write_text(source)
+              marker = 'var ytInitialPlayerResponse = '
+              if marker not in source:
+                  driver.save_screenshot('browser-error.png')
+                  raise RuntimeError('ytInitialPlayerResponse was not found')
+              start = source.index(marker) + len(marker)
+              response, _ = json.JSONDecoder().raw_decode(source[start:])
+              formats = response.get('streamingData', {}).get('formats', [])
+              direct = [f for f in formats if f.get('url')]
+              if not direct:
+                  driver.save_screenshot('browser-error.png')
+                  raise RuntimeError('No progressive media URL was present')
+              chosen = max(direct, key=lambda f: (f.get('height', 0), f.get('bitrate', 0)))
+              Path('stream-url.txt').write_text(chosen['url'])
+              Path('metadata.json').write_text(json.dumps({
+                  'video_id': VIDEO_ID,
+                  'title': response.get('videoDetails', {}).get('title'),
+                  'lengthSeconds': response.get('videoDetails', {}).get('lengthSeconds'),
+                  'chosen_format': {k: chosen.get(k) for k in [
+                      'itag', 'qualityLabel', 'width', 'height', 'fps', 'bitrate', 'mimeType', 'contentLength'
+                  ]},
+                  'playabilityStatus': response.get('playabilityStatus', {}),
+                  'storyboards': response.get('storyboards', {}),
+              }, indent=2))
           finally:
-              Path('browser-diagnostics.json').write_text(json.dumps(diagnostics, indent=2))
               driver.quit()
-              server.shutdown()
           PY
-          python capture.py
-          ffmpeg -hide_banner -loglevel warning -y -framerate 12 -i frames/frame_%04d.png \
-            -c:v libx264 -pix_fmt yuv420p -crf 18 -movflags +faststart source.mp4
+          python extract.py
+          STREAM_URL="$(cat stream-url.txt)"
+          ffmpeg -hide_banner -loglevel warning -y \
+            -headers $'Referer: https://www.youtube.com/\r\nUser-Agent: Mozilla/5.0\r\n' \
+            -i "$STREAM_URL" -an -c:v libx264 -preset veryfast -crf 18 \
+            -pix_fmt yuv420p -movflags +faststart source.mp4
           ffprobe -v error -show_entries format=duration,size -show_entries stream=width,height \
             -of json source.mp4 > media-info.json
 
-      - name: Make preview GIF
+      - name: Make final-section GIF
         run: |
-          ffmpeg -y -i source.mp4 -vf "fps=12,scale=600:-1:flags=lanczos,palettegen=stats_mode=diff" palette.png
-          ffmpeg -y -i source.mp4 -i palette.png -lavfi "fps=12,scale=600:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=sierra2_4a" -loop 0 final-capture.gif
+          set -euxo pipefail
+          DURATION="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 source.mp4)"
+          START="$(python -c "print(max(0, float('$DURATION') - 5.5))")"
+          ffmpeg -y -ss "$START" -i source.mp4 -vf "fps=15,scale=480:-1:flags=lanczos,palettegen=stats_mode=diff" palette.png
+          ffmpeg -y -ss "$START" -i source.mp4 -i palette.png -lavfi "fps=15,scale=480:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=sierra2_4a" -loop 0 buffalo-last-portion.gif
+          ffmpeg -y -ss "$START" -i source.mp4 -t 5.5 -c:v libx264 -an -movflags +faststart final-preview.mp4
 
       - name: Upload capture
         if: always()
@@ -219,15 +116,10 @@ jobs:
             source.mp4
             metadata.json
             media-info.json
-            final-capture.gif
-            browser-diagnostics.json
-            browser-*-error.png
-            browser-*-source.html
-            frames/frame_0000.png
-            frames/frame_0024.png
-            frames/frame_0048.png
-            frames/frame_0072.png
-            frames/frame_0107.png
+            buffalo-last-portion.gif
+            final-preview.mp4
+            shorts-page.html
+            browser-error.png
             xvfb.log
           if-no-files-found: warn
           retention-days: 1
