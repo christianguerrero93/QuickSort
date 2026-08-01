@@ -10,257 +10,71 @@ permissions:
 jobs:
   render:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install tools
+      - run: python -m pip install --quiet pillow
+      - name: Download official final-frame storyboard
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg xvfb
-          python -m pip install --quiet selenium yt-dlp pillow
-
-      - name: Capture Short or storyboard fallback
-        env:
-          DISPLAY: ':99'
-        run: |
-          set -euo pipefail
-          Xvfb :99 -screen 0 1280x900x24 >xvfb.log 2>&1 &
-          sleep 2
-          cat > capture.py <<'PY'
-          import html
+          python - <<'PY'
           import json
-          import re
-          import time
-          import urllib.parse
           import urllib.request
           from pathlib import Path
-
           from PIL import Image, ImageDraw
-          from selenium import webdriver
-          from selenium.webdriver.chrome.options import Options
-          from selenium.webdriver.common.by import By
-          from yt_dlp import YoutubeDL, parse_options
-          from yt_dlp.extractor.youtube import YoutubeIE
-          from yt_dlp.extractor.youtube.jsc.provider import JsChallengeRequest, JsChallengeType, NChallengeInput
 
-          VIDEO_ID = 'IipXNXmLfSs'
-          SHORT_URL = f'https://www.youtube.com/shorts/{VIDEO_ID}'
-          FPS = 12
-          CLIP_SECONDS = 6.0
-          diagnostics = []
-
-          opts = Options()
-          opts.binary_location = '/usr/bin/google-chrome'
-          for arg in [
-              '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--mute-audio',
-              '--autoplay-policy=no-user-gesture-required', '--window-size=1280,900', '--lang=en-US',
-              '--disable-blink-features=AutomationControlled',
-              '--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
-              '(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
-          ]:
-              opts.add_argument(arg)
-          opts.add_experimental_option('excludeSwitches', ['enable-automation'])
-          opts.add_experimental_option('useAutomationExtension', False)
-
-          driver = webdriver.Chrome(options=opts)
-          driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-              'source': "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+          url = ('https://i.ytimg.com/sb/IipXNXmLfSs/storyboard3_L0/default.jpg'
+                 '?sqp=-oaymwENSDfyq4qpAwVwAcABBqLzl_8DBgiAwPHSBg=='
+                 '&sigh=rs%24AOn4CLArGAuy9rKiFyz0DQHUJrpA6kUJMQ')
+          req = urllib.request.Request(url, headers={
+              'User-Agent': 'Mozilla/5.0',
+              'Referer': 'https://www.youtube.com/shorts/IipXNXmLfSs',
           })
-          source = ''
-          player_response = {}
-          try:
-              driver.get(SHORT_URL)
-              deadline = time.time() + 60
-              while time.time() < deadline:
-                  source = driver.page_source
-                  if 'var ytInitialPlayerResponse = ' in source and '"streamingData"' in source:
-                      break
-                  time.sleep(0.5)
-              Path('shorts-page.html').write_text(source)
-              driver.save_screenshot('shorts-state.png')
+          with urllib.request.urlopen(req, timeout=45) as response:
+              data = response.read()
+          Path('storyboard.jpg').write_bytes(data)
 
-              marker = 'var ytInitialPlayerResponse = '
-              if marker not in source:
-                  raise RuntimeError('ytInitialPlayerResponse missing')
-              start = source.index(marker) + len(marker)
-              player_response, _ = json.JSONDecoder().raw_decode(source[start:])
+          sheet = Image.open('storyboard.jpg').convert('RGB')
+          tile_w, tile_h, frame_count, cols, rows = 48, 27, 100, 10, 10
+          tiles = []
+          for idx in range(frame_count):
+              x = (idx % cols) * tile_w
+              y = (idx // cols) * tile_h
+              tiles.append(sheet.crop((x, y, x + tile_w, y + tile_h)))
 
-              formats = [f for f in player_response.get('streamingData', {}).get('formats', []) if f.get('url')]
-              if formats:
-                  chosen = max(formats, key=lambda f: (f.get('height', 0), f.get('bitrate', 0)))
-                  media_url = chosen['url']
+          # Labeled enlargement of all frames for choosing the exact tongue sequence.
+          scale = 6
+          contact = Image.new('RGB', (cols * tile_w * scale, rows * tile_h * scale), 'black')
+          draw = ImageDraw.Draw(contact)
+          for idx, tile in enumerate(tiles):
+              enlarged = tile.resize((tile_w * scale, tile_h * scale), Image.Resampling.NEAREST)
+              x = (idx % cols) * tile_w * scale
+              y = (idx // cols) * tile_h * scale
+              contact.paste(enlarged, (x, y))
+              draw.text((x + 3, y + 3), str(idx), fill='white', stroke_width=2, stroke_fill='black')
+          contact.save('storyboard-contact.png')
 
-                  player_patterns = [
-                      r'"PLAYER_JS_URL":"([^"]+)"', r'"jsUrl":"([^"]+)"',
-                      r'"js":"([^"]*?/s/player/[^"]+?base\\.js)"', r'(/s/player/[^"\\]+?/base\\.js)',
-                  ]
-                  player_path = None
-                  for pattern in player_patterns:
-                      match = re.search(pattern, source)
-                      if match:
-                          player_path = match.group(1)
-                          break
-                  if not player_path:
-                      raise RuntimeError('player JS URL missing')
-                  player_path = html.unescape(player_path).replace('\\/', '/')
-                  player_url = urllib.parse.urljoin('https://www.youtube.com', player_path)
-
-                  parsed = urllib.parse.urlsplit(media_url)
-                  pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-                  original_n = next((v for k, v in pairs if k == 'n'), None)
-                  if original_n:
-                      parsed_options = parse_options([
-                          '--js-runtimes', 'node', '--remote-components', 'ejs:github', '--quiet'
-                      ])
-                      with YoutubeDL(parsed_options.ydl_opts) as ydl:
-                          ie = YoutubeIE(ydl)
-                          ie.initialize()
-                          req = JsChallengeRequest(
-                              type=JsChallengeType.N, video_id=VIDEO_ID,
-                              input=NChallengeInput(challenges=[original_n], player_url=player_url))
-                          responses = ie._jsc_director.bulk_solve([req])
-                          solved_n = responses[0][1].output.results[original_n] if responses else None
-                      if solved_n:
-                          pairs = [(k, solved_n if k == 'n' else v) for k, v in pairs]
-                          media_url = urllib.parse.urlunsplit((
-                              parsed.scheme, parsed.netloc, parsed.path,
-                              urllib.parse.urlencode(pairs), parsed.fragment))
-
-                  try:
-                      driver.get(media_url)
-                      deadline = time.time() + 30
-                      video = None
-                      state = None
-                      while time.time() < deadline:
-                          videos = driver.find_elements(By.TAG_NAME, 'video')
-                          if videos:
-                              video = max(videos, key=lambda e: e.size.get('width', 0) * e.size.get('height', 0))
-                              state = driver.execute_script('''
-                                  const v=arguments[0]; v.muted=true; v.volume=0; v.play().catch(()=>{});
-                                  return {duration:Number.isFinite(v.duration)?v.duration:0,
-                                          ready:v.readyState, current:v.currentTime,
-                                          error:v.error ? v.error.message : null};
-                              ''', video)
-                              if state['duration'] > 0 and state['ready'] >= 2:
-                                  break
-                          time.sleep(0.5)
-                      if not video or not state or state['duration'] <= 0 or state['ready'] < 2:
-                          raise RuntimeError(f'media navigation not playable: {state}')
-
-                      duration = float(state['duration'])
-                      clip_start = max(0.0, duration - CLIP_SECONDS)
-                      driver.execute_script('''
-                          const v=arguments[0]; v.muted=true; v.volume=0;
-                          v.currentTime=arguments[1]; v.play().catch(()=>{});
-                      ''', video, clip_start)
-                      deadline = time.time() + 20
-                      while time.time() < deadline:
-                          current, ready = driver.execute_script(
-                              'return [arguments[0].currentTime,arguments[0].readyState];', video)
-                          if current >= max(0, clip_start - 0.3) and ready >= 2:
-                              break
-                          time.sleep(0.1)
-
-                      frames_dir = Path('browser_frames')
-                      frames_dir.mkdir(exist_ok=True)
-                      total = int(CLIP_SECONDS * FPS)
-                      capture_start = time.monotonic()
-                      for i in range(total):
-                          target = capture_start + i / FPS
-                          delay = target - time.monotonic()
-                          if delay > 0:
-                              time.sleep(delay)
-                          video.screenshot(str(frames_dir / f'frame_{i:04d}.png'))
-                      diagnostics.append({'browser_media_capture': 'success', 'duration': duration, 'frames': total})
-                  except Exception as exc:
-                      diagnostics.append({'browser_media_capture': 'failed', 'error': repr(exc), 'url': driver.current_url})
-                      driver.save_screenshot('media-state.png')
-          except Exception as exc:
-              diagnostics.append({'page_parse': 'failed', 'error': repr(exc)})
-          finally:
-              driver.quit()
-
-          # Always attempt the official YouTube storyboard as a fallback and diagnostic.
-          try:
-              spec = player_response['storyboards']['playerStoryboardSpecRenderer']['spec']
-              base, level = spec.split('|', 1)
-              fields = level.split('#')
-              tile_w, tile_h, frame_count, cols, rows = map(int, fields[:5])
-              sigh = fields[-1]
-              storyboard_url = base.replace('$L', '0').replace('$N', 'M0')
-              separator = '&' if '?' in storyboard_url else '?'
-              storyboard_url += separator + 'sigh=' + urllib.parse.quote(sigh, safe='$')
-              request = urllib.request.Request(storyboard_url, headers={
-                  'User-Agent': 'Mozilla/5.0', 'Referer': SHORT_URL,
-              })
-              with urllib.request.urlopen(request, timeout=45) as response:
-                  Path('storyboard.jpg').write_bytes(response.read())
-
-              sheet = Image.open('storyboard.jpg').convert('RGB')
-              tiles = []
-              for idx in range(frame_count):
-                  x = (idx % cols) * tile_w
-                  y = (idx // cols) * tile_h
-                  tiles.append(sheet.crop((x, y, x + tile_w, y + tile_h)))
-
-              # Contact sheet for inspecting the final 40 storyboard frames.
-              start_idx = max(0, frame_count - 40)
-              final_tiles = tiles[start_idx:]
-              scale = 5
-              contact = Image.new('RGB', (cols * tile_w * scale, 4 * tile_h * scale), 'black')
-              draw = ImageDraw.Draw(contact)
-              for j, tile in enumerate(final_tiles):
-                  up = tile.resize((tile_w * scale, tile_h * scale), Image.Resampling.NEAREST)
-                  x = (j % cols) * tile_w * scale
-                  y = (j // cols) * tile_h * scale
-                  contact.paste(up, (x, y))
-                  draw.text((x + 2, y + 2), str(start_idx + j), fill='white', stroke_width=1, stroke_fill='black')
-              contact.save('storyboard-final-contact.png')
-
-              gif_frames = [
-                  tile.resize((tile_w * 10, tile_h * 10), Image.Resampling.LANCZOS)
-                  for tile in final_tiles
-              ]
-              gif_frames[0].save(
-                  'storyboard-final.gif', save_all=True, append_images=gif_frames[1:],
-                  duration=150, loop=0, optimize=False)
-              diagnostics.append({
-                  'storyboard': 'success', 'tile_size': [tile_w, tile_h],
-                  'frame_count': frame_count, 'sheet_size': list(sheet.size),
-              })
-          except Exception as exc:
-              diagnostics.append({'storyboard': 'failed', 'error': repr(exc)})
-
-          Path('diagnostics.json').write_text(json.dumps(diagnostics, indent=2))
+          # Broad ending preview; this will be refined locally after visual inspection.
+          start_idx = 55
+          preview_tiles = tiles[start_idx:]
+          frames = [t.resize((480, 270), Image.Resampling.LANCZOS) for t in preview_tiles]
+          frames[0].save(
+              'storyboard-ending.gif', save_all=True, append_images=frames[1:],
+              duration=150, loop=0, optimize=False)
+          Path('storyboard-metadata.json').write_text(json.dumps({
+              'url': url,
+              'sheet_size': list(sheet.size),
+              'tile_size': [tile_w, tile_h],
+              'frame_count': frame_count,
+              'preview_start_index': start_idx,
+          }, indent=2))
           PY
-          python capture.py
-
-          if [ -d browser_frames ] && compgen -G 'browser_frames/frame_*.png' >/dev/null; then
-            ffmpeg -hide_banner -loglevel warning -y -framerate 12 -i browser_frames/frame_%04d.png \
-              -c:v libx264 -pix_fmt yuv420p -crf 18 -movflags +faststart browser-capture.mp4
-            ffmpeg -hide_banner -loglevel warning -y -i browser-capture.mp4 \
-              -vf "fps=12,scale=480:-1:flags=lanczos,palettegen=stats_mode=diff" browser-palette.png
-            ffmpeg -hide_banner -loglevel warning -y -i browser-capture.mp4 -i browser-palette.png \
-              -lavfi "fps=12,scale=480:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=sierra2_4a" \
-              -loop 0 browser-final.gif
-          fi
-
-      - name: Upload result
-        if: always()
+      - name: Upload storyboard frames
         uses: actions/upload-artifact@v4
         with:
-          name: buffalo-short-media
+          name: buffalo-storyboard
           path: |
-            browser-final.gif
-            browser-capture.mp4
-            storyboard-final.gif
-            storyboard-final-contact.png
             storyboard.jpg
-            diagnostics.json
-            shorts-state.png
-            media-state.png
-            shorts-page.html
-            xvfb.log
-          if-no-files-found: warn
+            storyboard-contact.png
+            storyboard-ending.gif
+            storyboard-metadata.json
           retention-days: 1
