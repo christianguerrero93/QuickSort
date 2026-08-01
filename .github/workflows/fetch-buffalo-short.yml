@@ -1,35 +1,21 @@
 name: Fetch Buffalo Short
-
 on:
   pull_request:
     branches: [master]
-
 permissions:
   contents: read
-
 jobs:
   inspect:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: python -m pip install --quiet yt-dlp
-      - name: Inspect YoutubeIE helpers
+      - name: Locate n-signature implementation
         run: |
-          python - <<'PY'
-          import inspect
-          import yt_dlp
-          from yt_dlp.extractor.youtube import YoutubeIE
-          print('version', yt_dlp.version.__version__)
-          for name in dir(YoutubeIE):
-              if any(x in name.lower() for x in ('nsig','decrypt','player_js','signature')):
-                  obj = getattr(YoutubeIE, name)
-                  try:
-                      print(name, inspect.signature(obj))
-                  except Exception:
-                      print(name, type(obj))
-          for name in ('_decrypt_nsig', '_extract_n_function_name', '_decrypt_signature'):
-              obj = getattr(YoutubeIE, name, None)
-              if obj:
-                  print('\nSOURCE', name)
-                  print(inspect.getsource(obj))
+          ROOT="$(python - <<'PY'
+          import pathlib, yt_dlp
+          print(pathlib.Path(yt_dlp.__file__).parent)
           PY
+          )"
+          echo "ROOT=$ROOT"
+          grep -RIn --include='*.py' -E 'decrypt_nsig|nsig|n_function|jsc' "$ROOT/extractor/youtube" "$ROOT" | head -300
